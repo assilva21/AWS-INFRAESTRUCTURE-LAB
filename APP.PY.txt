@@ -1,0 +1,129 @@
+from flask import Flask, request, render_template_string
+import psycopg2
+import boto3
+import base64
+
+app = Flask(__name__)
+
+# Diseño visual (HTML y JavaScript) optimizado para mostrar la imagen
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Cloud e IA by AS</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; margin-top: 40px; background-color: #f4f4f9; color: #333;}
+        .container { background: white; padding: 30px; border-radius: 10px; box-shadow: 0px 0px 15px rgba(0,0,0,0.1); display: inline-block; max-width: 500px; width: 100%; }
+        input, button { margin: 12px 0; padding: 12px; font-size: 16px; width: 90%; box-sizing: border-box; }
+        input[type="file"] { border: 1px dashed #ccc; background: #fafafa; cursor: pointer; }
+        button { background-color: #ff9900; color: white; border: none; cursor: pointer; border-radius: 5px; font-weight: bold;}
+        button:hover { background-color: #e68a00; }
+        .preview-box { margin: 15px auto; max-width: 300px; display: none; }
+        .preview-box img { width: 100%; border-radius: 8px; box-shadow: 0px 4px 6px rgba(0,0,0,0.1); }
+        .result-box { margin-top: 20px; padding: 15px; border-radius: 5px; background-color: #eef9f0; border: 1px solid #c2ebd0; }
+    </style>
+    <script>
+        // Función en JavaScript para previsualizar la imagen LOCALMENTE antes de subirla
+        function previewImage(event) {
+            var reader = new FileReader();
+            reader.onload = function() {
+                var output = document.getElementById('image_preview');
+                output.src = reader.result;
+                document.getElementById('preview_container').style.display = 'block';
+            }
+            reader.readAsDataURL(event.target.files[0]);
+        }
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1>Cloud e IA by AS ☁️🤖</h1>
+        <p>Adjunta tu imagen y con IA identifico qué es.</p>
+        
+        <form action="/" method="POST" enctype="multipart/form-data">
+            <input type="text" name="nombre_usuario" placeholder="Ingresa un nombre para la imagen" required><br>
+            
+            <input type="file" name="imagen" accept="image/*" onchange="previewImage(event)" required><br>
+            
+            <div id="preview_container" class="preview-box">
+                <p style="font-size: 12px; color: gray; margin: 0 0 5px 0;">Vista previa de selección:</p>
+                <img id="image_preview" src="" alt="Vista previa">
+            </div>
+
+            <button type="submit">Analizar y Guardar</button>
+        </form>
+
+        {% if resultado %}
+            <div class="result-box">
+                <h3>Resultado de la IA:</h3>
+                <p><strong>Identificado como:</strong> {{ resultado }}</p>
+                
+                {% if img_data %}
+                    <div style="max-width: 250px; margin: 10px auto;">
+                        <img src="{{ img_data }}" style="width: 100%; border-radius: 5px;" alt="Imagen analizada">
+                    </div>
+                {% endif %}
+                
+                <p style="color: green; font-size: 14px; font-weight: bold; margin-top: 10px;">✅ Registro guardado exitosamente en RDS.</p>
+            </div>
+        {% endif %}
+    </div>
+</body>
+</html>
+"""
+
+# Configuración de tu Base de Datos RDS (Reemplaza con tus credenciales reales)
+DB_HOST = "---"
+DB_USER = "postgres"
+DB_PASS = "---"
+DB_NAME = "app_db"
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    resultado_ia = None
+    img_base64 = None
+    
+    if request.method == "POST":
+        nombre_usuario = request.form["nombre_usuario"]
+        imagen = request.files["imagen"]
+        
+        if imagen:
+            # 1. Leer los bytes binarios de la imagen una sola vez
+            image_bytes = imagen.read()
+            
+            # 2. Convertir los mismos bytes a formato Base64 para poder dibujarla en el HTML resultante
+            encoded_image = base64.b64encode(image_bytes).decode('utf-8')
+            img_base64 = f"data:{imagen.content_type};base64,{encoded_image}"
+            
+            # 3. Enviar la imagen a Amazon Rekognition
+            try:
+                rekognition = boto3.client('rekognition', region_name='us-east-1')
+                response = rekognition.detect_labels(Image={'Bytes': image_bytes}, MaxLabels=1)
+                
+                if response['Labels']:
+                    resultado_ia = response['Labels'][0]['Name']
+                else:
+                    resultado_ia = "Desconocido (No se detectaron etiquetas)"
+            except Exception as e:
+                resultado_ia = "Error de IA (Verifica Rol IAM): " + str(e)
+
+            # 4. Guardar en la base de datos PostgreSQL en la VPC privada
+            try:
+                conn = psycopg2.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, dbname=DB_NAME)
+                cursor = conn.cursor()
+                # Modificamos la query para guardar el nombre personalizado que ingresa el usuario
+                cursor.execute(
+                    "INSERT INTO analisis_imagenes (nombre_archivo, resultado_ia, porcentaje_confianza) VALUES (%s, %s, %s)",
+                    (nombre_usuario, resultado_ia, 100)
+                )
+                conn.commit()
+                cursor.close()
+                conn.close()
+            except Exception as e:
+                # Si falla la base de datos, truncamos el error para que quepa en el campo varchar
+                resultado_ia = ("Error de BD: " + str(e))[:50]
+
+    return render_template_string(HTML_TEMPLATE, resultado=resultado_ia, img_data=img_base64)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
